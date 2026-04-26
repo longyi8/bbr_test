@@ -3,6 +3,10 @@ Green_font_prefix="\033[32m"
 Red_font_prefix="\033[31m"
 Yellow_font_prefix="\033[33m"
 Cyan_font_prefix="\033[36m"
+Blue_font_prefix="\033[34m"
+Purple_font_prefix="\033[35m"
+White_font_prefix="\033[37m"
+Bold_prefix="\033[1m"
 Font_color_suffix="\033[0m"
 Info="${Green_font_prefix}[信息]${Font_color_suffix}"
 Error="${Red_font_prefix}[错误]${Font_color_suffix}"
@@ -12,8 +16,9 @@ copyright(){
 echo "\
 ############################################################
 
-  Linux 网络优化脚本 v2.0
+  Linux 网络优化脚本 v3.0
   针对代理/隧道服务器深度调优
+  新增: 自动环境检测 + 智能自适应优化
   By Longyi | https://github.com/longyi8
 
 ############################################################
@@ -375,6 +380,429 @@ get_system_info() {
   virt_check
 }
 
+# ============================================================
+# v3.0 新增: 环境检测函数
+# ============================================================
+
+# 检测单个目标的 RTT (返回毫秒数, 失败返回 -1)
+_ping_one() {
+  local ip="$1"
+  local result
+  result=$(ping -c 3 -W 3 "$ip" 2>/dev/null | awk -F'/' '/avg/{print $5}')
+  if [[ -n "$result" ]]; then
+    printf "%.1f" "$result"
+  else
+    echo "-1"
+  fi
+}
+
+# 检测 RTT — 设置全局变量 RTT_RESULTS (关联数组) 和 RTT_AVG (平均值)
+detect_rtt() {
+  declare -gA RTT_RESULTS
+  local total=0 count=0
+
+  local -A targets=(
+    ["北京电信"]="219.141.136.10"
+    ["北京联通"]="202.106.50.1"
+    ["北京移动"]="221.179.155.161"
+    ["东京CF"]="1.1.1.1"
+    ["洛杉矶CF"]="198.41.200.12"
+    ["法兰克福CF"]="1.0.0.1"
+  )
+
+  local order=("北京电信" "北京联通" "北京移动" "东京CF" "洛杉矶CF" "法兰克福CF")
+
+  for name in "${order[@]}"; do
+    local ip="${targets[$name]}"
+    local rtt
+    rtt=$(_ping_one "$ip")
+    RTT_RESULTS["$name"]="$rtt"
+    if [[ "$rtt" != "-1" ]]; then
+      total=$(echo "$total + $rtt" | bc 2>/dev/null || awk "BEGIN{print $total + $rtt}")
+      count=$((count + 1))
+    fi
+  done
+
+  if [[ $count -gt 0 ]]; then
+    RTT_AVG=$(awk "BEGIN{printf \"%.1f\", $total / $count}")
+  else
+    RTT_AVG="-1"
+  fi
+}
+
+# 检测带宽 — 设置全局变量 NIC_NAME, NIC_SPEED_MBPS
+detect_bandwidth() {
+  # 找到默认路由网卡
+  NIC_NAME=$(ip route show default 2>/dev/null | awk '/default/{print $5; exit}')
+  [[ -z "$NIC_NAME" ]] && NIC_NAME=$(ls /sys/class/net/ | grep -v lo | head -1)
+
+  NIC_SPEED_MBPS=1000  # 默认 1Gbps
+
+  # 方法1: ethtool
+  if command -v ethtool &>/dev/null && [[ -n "$NIC_NAME" ]]; then
+    local speed
+    speed=$(ethtool "$NIC_NAME" 2>/dev/null | awk '/Speed:/{gsub(/[^0-9]/,"",$2); print $2}')
+    if [[ -n "$speed" && "$speed" -gt 0 ]] 2>/dev/null; then
+      NIC_SPEED_MBPS="$speed"
+      return
+    fi
+  fi
+
+  # 方法2: /sys/class/net
+  if [[ -f "/sys/class/net/${NIC_NAME}/speed" ]]; then
+    local speed
+    speed=$(cat "/sys/class/net/${NIC_NAME}/speed" 2>/dev/null)
+    if [[ -n "$speed" && "$speed" -gt 0 ]] 2>/dev/null; then
+      NIC_SPEED_MBPS="$speed"
+      return
+    fi
+  fi
+
+  # 方法3: 虚拟机常见速率估算
+  if [[ -d "/sys/class/net/${NIC_NAME}" ]]; then
+    # virtio 等虚拟网卡无 speed, 默认 1Gbps
+    NIC_SPEED_MBPS=1000
+  fi
+}
+
+# 检测内存 — 设置全局变量 MEM_TOTAL_BYTES, MEM_TOTAL_MB, MEM_TOTAL_GB
+detect_memory() {
+  MEM_TOTAL_BYTES=$(free -b 2>/dev/null | awk '/Mem:/{print $2}')
+  [[ -z "$MEM_TOTAL_BYTES" ]] && MEM_TOTAL_BYTES=$(awk '/MemTotal/{print $2*1024}' /proc/meminfo 2>/dev/null)
+  [[ -z "$MEM_TOTAL_BYTES" ]] && MEM_TOTAL_BYTES=0
+
+  MEM_TOTAL_MB=$((MEM_TOTAL_BYTES / 1024 / 1024))
+  MEM_TOTAL_GB=$(awk "BEGIN{printf \"%.1f\", $MEM_TOTAL_BYTES / 1024 / 1024 / 1024}")
+}
+
+# 检测 CPU — 设置全局变量 CPU_CORES
+detect_cpu() {
+  CPU_CORES=$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 1)
+}
+
+# 综合检测并彩色输出
+detect_environment() {
+  echo -e "${Info} 开始环境检测，请稍候..."
+  echo ""
+
+  detect_cpu
+  detect_memory
+  detect_bandwidth
+  detect_rtt
+
+  # --- 彩色表格输出 ---
+  local line="${Cyan_font_prefix}╔══════════════════════════════════════════════════════╗${Font_color_suffix}"
+  local line2="${Cyan_font_prefix}╠══════════════════════════════════════════════════════╣${Font_color_suffix}"
+  local line3="${Cyan_font_prefix}╚══════════════════════════════════════════════════════╝${Font_color_suffix}"
+
+  echo -e "$line"
+  echo -e "${Cyan_font_prefix}║${Font_color_suffix}  ${Bold_prefix}${Green_font_prefix}🖥  系统环境检测结果${Font_color_suffix}                              ${Cyan_font_prefix}║${Font_color_suffix}"
+  echo -e "$line2"
+
+  # CPU
+  echo -e "${Cyan_font_prefix}║${Font_color_suffix}  ${Yellow_font_prefix}CPU 核数${Font_color_suffix}      : ${Bold_prefix}${CPU_CORES}${Font_color_suffix} 核                                  ${Cyan_font_prefix}║${Font_color_suffix}"
+
+  # 内存
+  local mem_color="${Green_font_prefix}"
+  if [[ $MEM_TOTAL_MB -lt 1024 ]]; then
+    mem_color="${Red_font_prefix}"
+  elif [[ $MEM_TOTAL_MB -lt 4096 ]]; then
+    mem_color="${Yellow_font_prefix}"
+  fi
+  echo -e "${Cyan_font_prefix}║${Font_color_suffix}  ${Yellow_font_prefix}内存${Font_color_suffix}          : ${mem_color}${Bold_prefix}${MEM_TOTAL_GB} GB${Font_color_suffix} (${MEM_TOTAL_MB} MB)                    ${Cyan_font_prefix}║${Font_color_suffix}"
+
+  # 网卡
+  echo -e "${Cyan_font_prefix}║${Font_color_suffix}  ${Yellow_font_prefix}网卡${Font_color_suffix}          : ${Bold_prefix}${NIC_NAME}${Font_color_suffix} @ ${Green_font_prefix}${NIC_SPEED_MBPS} Mbps${Font_color_suffix}                   ${Cyan_font_prefix}║${Font_color_suffix}"
+
+  echo -e "$line2"
+  echo -e "${Cyan_font_prefix}║${Font_color_suffix}  ${Bold_prefix}${Green_font_prefix}🌐 RTT 延迟测试${Font_color_suffix}                                    ${Cyan_font_prefix}║${Font_color_suffix}"
+  echo -e "$line2"
+
+  local order=("北京电信" "北京联通" "北京移动" "东京CF" "洛杉矶CF" "法兰克福CF")
+  local -A ips=(
+    ["北京电信"]="219.141.136.10"
+    ["北京联通"]="202.106.50.1"
+    ["北京移动"]="221.179.155.161"
+    ["东京CF"]="1.1.1.1"
+    ["洛杉矶CF"]="198.41.200.12"
+    ["法兰克福CF"]="1.0.0.1"
+  )
+
+  for name in "${order[@]}"; do
+    local rtt="${RTT_RESULTS[$name]}"
+    local ip="${ips[$name]}"
+    local rtt_color="${Green_font_prefix}"
+    local rtt_display="${rtt} ms"
+    if [[ "$rtt" == "-1" ]]; then
+      rtt_color="${Red_font_prefix}"
+      rtt_display="超时"
+    elif (( $(echo "$rtt > 150" | bc 2>/dev/null || awk "BEGIN{print ($rtt>150)}") )); then
+      rtt_color="${Red_font_prefix}"
+    elif (( $(echo "$rtt > 30" | bc 2>/dev/null || awk "BEGIN{print ($rtt>30)}") )); then
+      rtt_color="${Yellow_font_prefix}"
+    fi
+    printf "  ${Cyan_font_prefix}║${Font_color_suffix}  %-10s %-16s ${rtt_color}%8s${Font_color_suffix}            ${Cyan_font_prefix}║${Font_color_suffix}\n" "$name" "$ip" "$rtt_display"
+  done
+
+  echo -e "$line2"
+
+  # RTT 分级
+  local rtt_level rtt_level_color
+  if [[ "$RTT_AVG" == "-1" ]]; then
+    rtt_level="无法检测"
+    rtt_level_color="${Red_font_prefix}"
+  elif (( $(echo "$RTT_AVG < 30" | bc 2>/dev/null || awk "BEGIN{print ($RTT_AVG<30)}") )); then
+    rtt_level="低延迟 (<30ms) — 本地/近距离"
+    rtt_level_color="${Green_font_prefix}"
+  elif (( $(echo "$RTT_AVG < 150" | bc 2>/dev/null || awk "BEGIN{print ($RTT_AVG<150)}") )); then
+    rtt_level="中延迟 (30-150ms) — 亚太区域"
+    rtt_level_color="${Yellow_font_prefix}"
+  else
+    rtt_level="高延迟 (>150ms) — 跨洲际"
+    rtt_level_color="${Red_font_prefix}"
+  fi
+
+  echo -e "${Cyan_font_prefix}║${Font_color_suffix}  ${Yellow_font_prefix}平均 RTT${Font_color_suffix}      : ${Bold_prefix}${RTT_AVG} ms${Font_color_suffix}                              ${Cyan_font_prefix}║${Font_color_suffix}"
+  echo -e "${Cyan_font_prefix}║${Font_color_suffix}  ${Yellow_font_prefix}延迟分级${Font_color_suffix}      : ${rtt_level_color}${rtt_level}${Font_color_suffix}  ${Cyan_font_prefix}║${Font_color_suffix}"
+
+  # 内存分级
+  local mem_level
+  if [[ $MEM_TOTAL_MB -lt 1024 ]]; then
+    mem_level="小内存 (<1GB) — 缓冲区封顶 16MB"
+  elif [[ $MEM_TOTAL_MB -lt 4096 ]]; then
+    mem_level="中内存 (1-4GB) — 缓冲区封顶 64MB"
+  else
+    mem_level="大内存 (>4GB) — 缓冲区最高 128MB"
+  fi
+  echo -e "${Cyan_font_prefix}║${Font_color_suffix}  ${Yellow_font_prefix}内存分级${Font_color_suffix}      : ${mem_color}${mem_level}${Font_color_suffix}  ${Cyan_font_prefix}║${Font_color_suffix}"
+
+  echo -e "$line3"
+  echo ""
+}
+
+# ============================================================
+# v3.0 新增: 智能一键优化
+# ============================================================
+
+smart_optimize() {
+  echo -e "${Info} 🧠 智能一键优化: 先检测环境，再自适应配置"
+  echo ""
+
+  # Step 1: 检测环境
+  detect_environment
+
+  # Step 2: 计算最佳参数
+  echo -e "${Info} 正在根据检测结果计算最佳参数..."
+
+  # --- 内存分级: 确定缓冲区上限 ---
+  local buf_max_bytes
+  if [[ $MEM_TOTAL_MB -lt 1024 ]]; then
+    buf_max_bytes=$((16 * 1024 * 1024))    # 16MB
+    echo -e "  内存 < 1GB → 缓冲区封顶 ${Yellow_font_prefix}16 MB${Font_color_suffix}"
+  elif [[ $MEM_TOTAL_MB -lt 4096 ]]; then
+    buf_max_bytes=$((64 * 1024 * 1024))    # 64MB
+    echo -e "  内存 1-4GB → 缓冲区封顶 ${Yellow_font_prefix}64 MB${Font_color_suffix}"
+  else
+    buf_max_bytes=$((128 * 1024 * 1024))   # 128MB
+    echo -e "  内存 > 4GB → 缓冲区最高 ${Green_font_prefix}128 MB${Font_color_suffix}"
+  fi
+
+  # --- BDP 计算: buffer = bandwidth(bps) * RTT(s) * 2 ---
+  local bw_bps=$((NIC_SPEED_MBPS * 1000000))  # Mbps -> bps
+  local rtt_sec
+  if [[ "$RTT_AVG" == "-1" ]]; then
+    rtt_sec="0.100"  # 默认 100ms
+  else
+    rtt_sec=$(awk "BEGIN{printf \"%.6f\", $RTT_AVG / 1000}")
+  fi
+  local bdp_bytes
+  bdp_bytes=$(awk "BEGIN{val=int($bw_bps * $rtt_sec * 2 / 8); printf \"%d\", val}")
+
+  # 取 BDP 和内存上限的较小值
+  if [[ $bdp_bytes -gt $buf_max_bytes ]]; then
+    bdp_bytes=$buf_max_bytes
+  fi
+  # 最小不低于 4MB
+  if [[ $bdp_bytes -lt 4194304 ]]; then
+    bdp_bytes=4194304
+  fi
+
+  local buf_max_human
+  buf_max_human=$(awk "BEGIN{printf \"%.1f MB\", $bdp_bytes / 1024 / 1024}")
+  echo -e "  BDP 计算 (${NIC_SPEED_MBPS}Mbps x ${RTT_AVG}ms x 2) → 最优缓冲区: ${Green_font_prefix}${buf_max_human}${Font_color_suffix}"
+
+  # --- RTT 分级: 确定 TCP 行为参数 ---
+  local slow_start_idle=0
+  local tcp_init_cwnd_comment=""
+  local notsent_lowat=16384
+  local rmem_default=1048576
+  local wmem_default=1048576
+  local tcp_rmem_init=87380
+  local tcp_wmem_init=65536
+  local fin_timeout=15
+  local keepalive_time=300
+
+  if [[ "$RTT_AVG" != "-1" ]] && (( $(awk "BEGIN{print ($RTT_AVG < 30)}") )); then
+    # 低延迟 (<30ms): 小 buffer, 快速恢复
+    echo -e "  RTT < 30ms → ${Green_font_prefix}低延迟模式${Font_color_suffix}: 小缓冲区 + 快速响应"
+    slow_start_idle=1
+    notsent_lowat=131072
+    tcp_rmem_init=131072
+    tcp_wmem_init=131072
+    rmem_default=262144
+    wmem_default=262144
+    fin_timeout=10
+    keepalive_time=600
+    tcp_init_cwnd_comment="# 低延迟: 保持 slow_start_after_idle=1, 大初始窗口"
+  elif [[ "$RTT_AVG" != "-1" ]] && (( $(awk "BEGIN{print ($RTT_AVG < 150)}") )); then
+    # 中延迟 (30-150ms): 标准大 buffer
+    echo -e "  RTT 30-150ms → ${Yellow_font_prefix}中延迟模式${Font_color_suffix}: 标准大缓冲区"
+    slow_start_idle=0
+    notsent_lowat=16384
+    tcp_rmem_init=87380
+    tcp_wmem_init=65536
+    rmem_default=1048576
+    wmem_default=1048576
+    fin_timeout=15
+    keepalive_time=300
+    tcp_init_cwnd_comment="# 中延迟: 关闭 slow_start_after_idle, 标准缓冲"
+  else
+    # 高延迟 (>150ms): 最大 buffer + 激进设置
+    echo -e "  RTT > 150ms → ${Red_font_prefix}高延迟模式${Font_color_suffix}: 最大缓冲区 + 激进恢复"
+    slow_start_idle=0
+    notsent_lowat=16384
+    tcp_rmem_init=87380
+    tcp_wmem_init=65536
+    rmem_default=2097152
+    wmem_default=2097152
+    fin_timeout=20
+    keepalive_time=120
+    tcp_init_cwnd_comment="# 高延迟: 关闭 slow_start_after_idle, 最大缓冲区"
+  fi
+
+  echo ""
+  read -p "确认应用智能优化参数? [y/N]: " confirm
+  if [[ ! "$confirm" =~ ^[yY]$ ]]; then
+    echo -e "${Tip} 已取消"
+    return
+  fi
+
+  echo -e "${Info} 正在应用智能优化配置..."
+
+  # Step 3: 清理旧配置 + 写入新配置
+  sysctl_clean \
+    net.ipv4.tcp_no_metrics_save \
+    net.ipv4.tcp_ecn \
+    net.ipv4.tcp_frto \
+    net.ipv4.tcp_mtu_probing \
+    net.ipv4.tcp_rfc1337 \
+    net.ipv4.tcp_sack \
+    net.ipv4.tcp_fack \
+    net.ipv4.tcp_window_scaling \
+    net.ipv4.tcp_adv_win_scale \
+    net.ipv4.tcp_moderate_rcvbuf \
+    net.ipv4.tcp_rmem \
+    net.ipv4.tcp_wmem \
+    net.core.rmem_max \
+    net.core.wmem_max \
+    net.core.rmem_default \
+    net.core.wmem_default \
+    net.ipv4.udp_rmem_min \
+    net.ipv4.udp_wmem_min \
+    net.core.default_qdisc \
+    net.ipv4.tcp_congestion_control \
+    net.ipv4.tcp_fastopen \
+    net.ipv4.tcp_slow_start_after_idle \
+    net.ipv4.tcp_notsent_lowat \
+    net.ipv4.tcp_tw_reuse \
+    net.ipv4.tcp_max_tw_buckets \
+    net.ipv4.tcp_fin_timeout \
+    net.ipv4.tcp_keepalive_time \
+    net.ipv4.tcp_keepalive_intvl \
+    net.ipv4.tcp_keepalive_probes \
+    net.ipv4.tcp_max_syn_backlog \
+    net.ipv4.tcp_synack_retries \
+    net.ipv4.tcp_syn_retries \
+    net.ipv4.tcp_timestamps \
+    net.ipv4.tcp_max_orphans \
+    net.core.somaxconn \
+    net.core.netdev_max_backlog \
+    net.core.netdev_budget \
+    net.core.netdev_budget_usecs
+
+  cat >> /etc/sysctl.conf << SYSEOF
+
+# ============ 智能自适应调优 (v3.0) ============
+# 检测环境: RTT=${RTT_AVG}ms | 带宽=${NIC_SPEED_MBPS}Mbps | 内存=${MEM_TOTAL_GB}GB | CPU=${CPU_CORES}核
+# 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
+${tcp_init_cwnd_comment}
+
+# --- BBR 拥塞控制 (Google TCP BBR) ---
+net.core.default_qdisc=fq                          # fq 队列调度器, BBR 最佳搭档
+net.ipv4.tcp_congestion_control=bbr                 # 启用 BBR 拥塞控制算法
+
+# --- 缓冲区 (基于 BDP=${buf_max_human} 计算) ---
+net.core.rmem_max=${bdp_bytes}                      # 接收缓冲区最大值 (所有协议)
+net.core.wmem_max=${bdp_bytes}                      # 发送缓冲区最大值 (所有协议)
+net.core.rmem_default=${rmem_default}               # 接收缓冲区默认值
+net.core.wmem_default=${wmem_default}               # 发送缓冲区默认值
+net.ipv4.tcp_rmem=4096 ${tcp_rmem_init} ${bdp_bytes}  # TCP 接收缓冲区 (min default max)
+net.ipv4.tcp_wmem=4096 ${tcp_wmem_init} ${bdp_bytes}  # TCP 发送缓冲区 (min default max)
+net.ipv4.udp_rmem_min=8192                          # UDP 接收缓冲区最小值
+net.ipv4.udp_wmem_min=8192                          # UDP 发送缓冲区最小值
+
+# --- TCP 行为优化 ---
+net.ipv4.tcp_no_metrics_save=1                      # 不缓存连接指标, 每次连接独立探测
+net.ipv4.tcp_ecn=2                                  # ECN: 服务端被动响应, 不主动发起
+net.ipv4.tcp_frto=2                                 # F-RTO: 区分真丢包和乱序导致的超时
+net.ipv4.tcp_mtu_probing=1                          # 路径 MTU 探测, 避免分片
+net.ipv4.tcp_rfc1337=1                              # 防止 TIME_WAIT 被旧报文重置
+net.ipv4.tcp_sack=1                                 # 选择性确认, 高效重传
+net.ipv4.tcp_fack=1                                 # 前向确认, 配合 SACK 提升效率
+net.ipv4.tcp_window_scaling=1                       # 窗口缩放, 支持大于 64KB 的窗口
+net.ipv4.tcp_adv_win_scale=2                        # 窗口大小计算系数
+net.ipv4.tcp_moderate_rcvbuf=1                      # 自动调整接收缓冲区
+net.ipv4.tcp_timestamps=1                           # 时间戳, RTT 精确计算必备
+
+# --- 延迟优化 ---
+net.ipv4.tcp_fastopen=3                             # TFO: 客户端+服务端都启用, 减少握手 RTT
+net.ipv4.tcp_slow_start_after_idle=${slow_start_idle}  # 空闲后是否慢启动 (高延迟关闭)
+net.ipv4.tcp_notsent_lowat=${notsent_lowat}         # 未发送数据低水位, 降低延迟
+
+# --- 连接回收 ---
+net.ipv4.tcp_tw_reuse=1                             # TIME_WAIT 重用, 加速端口回收
+net.ipv4.tcp_max_tw_buckets=2000000                 # TIME_WAIT 最大数量
+net.ipv4.tcp_fin_timeout=${fin_timeout}             # FIN_WAIT2 超时秒数
+net.ipv4.tcp_max_orphans=65536                      # 孤儿连接最大数量
+
+# --- Keepalive (快速检测死连接) ---
+net.ipv4.tcp_keepalive_time=${keepalive_time}       # 空闲多久开始探测 (秒)
+net.ipv4.tcp_keepalive_intvl=30                     # 探测间隔 (秒)
+net.ipv4.tcp_keepalive_probes=3                     # 探测次数, 超过则断开
+
+# --- 握手队列 ---
+net.ipv4.tcp_max_syn_backlog=65535                  # SYN 半连接队列大小
+net.ipv4.tcp_synack_retries=2                       # SYN-ACK 重试次数
+net.ipv4.tcp_syn_retries=3                          # SYN 重试次数
+net.core.somaxconn=65535                            # listen() 全连接队列大小
+
+# --- 网卡队列 ---
+net.core.netdev_max_backlog=65535                   # 网卡接收队列积压上限
+net.core.netdev_budget=600                          # 每次软中断处理包数
+net.core.netdev_budget_usecs=20000                  # 每次软中断时间预算 (微秒)
+SYSEOF
+
+  sysctl -p && sysctl --system
+
+  echo ""
+  echo -e "${Info} =========================================="
+  echo -e "${Info} 🧠 智能优化完成!"
+  echo -e "${Info} RTT: ${RTT_AVG}ms | 缓冲区: ${buf_max_human}"
+  echo -e "${Info} 建议继续执行 Conntrack + 转发 + 资源限制优化"
+  echo -e "${Info} 或重启系统使所有配置生效"
+  echo -e "${Info} =========================================="
+}
+
 menu() {
   echo -e "\
 ${Green_font_prefix}0.${Font_color_suffix} 升级脚本
@@ -386,6 +814,8 @@ ${Green_font_prefix}5.${Font_color_suffix} 系统资源限制调优
 ${Green_font_prefix}6.${Font_color_suffix} 屏蔽 ICMP  ${Green_font_prefix}7.${Font_color_suffix} 开放 ICMP
 ${Yellow_font_prefix}8.${Font_color_suffix} ⚡ 一键全部优化 (2+3+4+5)
 ${Cyan_font_prefix}9.${Font_color_suffix} 📊 查看当前优化状态
+${Blue_font_prefix}10.${Font_color_suffix} 🔍 自动检测环境 (RTT/带宽/内存/CPU)
+${Purple_font_prefix}11.${Font_color_suffix} 🧠 智能一键优化 (自动检测+自适应配置)
 "
 get_system_info
 echo -e "当前系统: ${Font_color_suffix}$opsy ${Green_font_prefix}$virtual${Font_color_suffix} $arch ${Green_font_prefix}$kern${Font_color_suffix}
@@ -403,9 +833,11 @@ echo -e "当前系统: ${Font_color_suffix}$opsy ${Green_font_prefix}$virtual${F
   7) unbanping ;;
   8) one_click ;;
   9) show_status ;;
+  10) detect_environment ;;
+  11) smart_optimize ;;
   *)
     clear
-    echo -e "${Error}: 请输入正确数字 [0-9]"
+    echo -e "${Error}: 请输入正确数字 [0-11]"
     sleep 2s
     copyright
     menu
